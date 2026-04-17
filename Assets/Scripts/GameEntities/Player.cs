@@ -1,51 +1,42 @@
-using Newtonsoft.Json.Linq;
-using System.Collections;
-using System.Collections.Generic;
-using Unity.Netcode;
+﻿using Unity.Netcode;
 using UnityEngine;
-using UnityEngine.UIElements;
+using System.Collections.Generic;
+
+// InputTick — stunTick n'est plus nécessaire
+public struct InputTick : INetworkSerializeByMemcpy
+{
+    public Vector2 input;
+    public bool stunPressed;
+    public int tick;      // local tick — réconciliation mouvement
+    public int stunTick;  // server tick — vérification stun
+}
 
 public struct StateTick : INetworkSerializeByMemcpy
 {
     public InputTick input;
     public Vector2 position;
 }
-public struct InputTick : INetworkSerializeByMemcpy
-{
-    public Vector2 input;
-    public int tick;
-}
 
 public class Player : NetworkBehaviour
 {
-    [SerializeField]
-    private float m_Velocity;
-
-    [SerializeField]
-    private float m_Size = 1;
+    [SerializeField] private float m_Velocity = 5f;
+    [SerializeField] private float m_Size = 1f;
 
     private GameState m_GameState;
+    private StateTick m_PredictedState;
 
-    private StateTick m_PredictedPosition;
+    private float TickDelta => 1f / NetworkManager.NetworkTickSystem.TickRate;
 
-    private float TickDelta => 1f / NetworkManager.Singleton.NetworkConfig.TickRate;
+    private NetworkVariable<StateTick> m_ServerState = new NetworkVariable<StateTick>();
 
-    private GameState GameState
-    {
-        get
-        {
-            if (m_GameState == null)
-                m_GameState = FindFirstObjectByType<GameState>();
-            return m_GameState;
-        }
-    }
-
-    private NetworkVariable<StateTick> m_Position = new NetworkVariable<StateTick>();
-
-    public Vector2 Position => (IsClient && IsOwner) ? m_PredictedPosition.position : m_Position.Value.position;
+    public Vector2 Position => (IsClient && IsOwner) ? m_PredictedState.position : m_ServerState.Value.position;
 
     private Queue<InputTick> m_InputQueue = new Queue<InputTick>();
-    private Queue<StateTick> m_StateTickQueue = new Queue<StateTick>();
+    private List<StateTick> m_StateHistory = new List<StateTick>(); // Changed to List for easier history management
+
+    private bool m_StunBuffered;
+    private bool m_HasNewServerState;
+    private StateTick m_LatestServerState;
 
     private void Awake()
     {
@@ -55,118 +46,78 @@ public class Player : NetworkBehaviour
     public override void OnNetworkSpawn()
     {
         NetworkManager.NetworkTickSystem.Tick += OnNetworkTick;
-        m_Position.OnValueChanged += Reconciliate;
+        m_ServerState.OnValueChanged += OnServerStateChanged;
 
-        //if (IsClient && !IsServer)
-            //GameState.m_IsStunned.OnValueChanged += ReconciliateStunTick;
-
-        base.OnNetworkSpawn();
+        if (IsOwner)
+        {
+            m_PredictedState = new StateTick { position = transform.position };
+        }
     }
 
     public override void OnNetworkDespawn()
     {
         if (NetworkManager != null && NetworkManager.NetworkTickSystem != null)
             NetworkManager.NetworkTickSystem.Tick -= OnNetworkTick;
-
-        m_Position.OnValueChanged -= Reconciliate;
-
-        //if (IsClient && !IsServer)
-            //GameState.m_IsStunned.OnValueChanged -= ReconciliateStunTick;
-
-        base.OnNetworkDespawn();
+        m_ServerState.OnValueChanged -= OnServerStateChanged;
     }
 
-    private void ReconciliateStunTick(StunStatus oldStatus, StunStatus newStatus)
+    private void Update()
     {
-        GameState.local_Stunned = newStatus;
+        // Buffer input so we don't miss keydowns between tick intervals
+        if (IsClient && IsOwner && Input.GetKeyDown(KeyCode.Space))
+        {
+            m_StunBuffered = true;
+        }
     }
+
+    private void OnServerStateChanged(StateTick oldState, StateTick newState)
+    {
+        if (IsClient && IsOwner)
+        {
+            m_LatestServerState = newState;
+            m_HasNewServerState = true; // Flag for OnNetworkTick to handle
+        }
+    }
+
     private void OnNetworkTick()
     {
-        if (GameState == null) return;
+        if (m_GameState == null) return;
 
-        //Debug.Log(GameState.local_Stunned.endTick);
-        //Debug.Log(GameState.m_IsStunned.Value.endTick);
         if (IsServer)
             UpdatePositionServer();
 
         if (IsClient && IsOwner)
         {
-            if (!IsStunnedAtTick(NetworkManager.NetworkTickSystem.LocalTime.Tick))
-                UpdateInputClient();
+            if (m_HasNewServerState)
+            {
+                Reconciliate();
+                m_HasNewServerState = false;
+            }
+            UpdateInputClient();
         }
-    }
-
-    private bool IsStunnedAtTick(int tick)
-    {
-        var status = GameState.IsStunned;
-        //Debug.Log(status.endTick);
-        return status.IsStunned && tick < status.endTick;
     }
 
     private void UpdatePositionServer()
     {
-        if (m_InputQueue.Count > 0)
+        while (m_InputQueue.Count > 0)
         {
             var input = m_InputQueue.Dequeue();
-            StateTick position = m_Position.Value;
+            int localTick = NetworkUtility.GetLocalTick();    // tick du client — pour la réconciliation
+            int serverTick = NetworkManager.ServerTime.Tick;
 
-            if (!IsStunnedAtTick(input.tick))
-                position.position += input.input * m_Velocity * TickDelta;
+            if (input.stunPressed)
+                m_GameState.ApplyStun(input.tick);  // ← toujours le tick serveur courant
 
-            position.input = input;
-            position.position = ClampToGameArea(position.position);
-            m_Position.Value = position;
+            StateTick state = m_ServerState.Value;
+
+            if (!m_GameState.IsStunnedAtTick(input.tick))  // ← même tick
+                state.position += input.input * m_Velocity * TickDelta;
+
+            state.input = input;
+            state.position = ClampToGameArea(state.position);
+            m_ServerState.Value = state;
         }
     }
-
-    private void PredictPosition(InputTick inputTick)
-    {
-        var position = m_PredictedPosition;
-
-        if (!IsStunnedAtTick(inputTick.tick))
-            position.position += inputTick.input * m_Velocity * TickDelta;
-
-        position.input = inputTick;
-        position.position = ClampToGameArea(position.position);
-        m_PredictedPosition = position;
-    }
-
-    private void Reconciliate(StateTick oldState, StateTick state)
-    {
-        if (IsServer) return;
-
-        if (!IsOwner)
-        {
-            m_PredictedPosition = state;
-            return;
-        }
-
-        while (m_StateTickQueue.Count > 0)
-        {
-            if (m_StateTickQueue.Peek().input.tick < state.input.tick)
-                m_StateTickQueue.Dequeue();
-            else
-                break;
-        }
-
-        if (m_StateTickQueue.Count > 0 &&
-            Vector2.Distance(m_StateTickQueue.Peek().position, state.position) > 0.001f)
-        {
-            m_StateTickQueue.Dequeue();
-            //LogStateQueue();
-            m_PredictedPosition = state;
-            Queue<StateTick> correctedQueue = new Queue<StateTick>();
-
-            foreach (var s in m_StateTickQueue)
-            {
-                PredictPosition(s.input);
-                correctedQueue.Enqueue(m_PredictedPosition);
-            }
-            //Debug.Log($"(Tick:{state.input.tick}, Pos:{state.position}) -> ");
-            m_StateTickQueue = correctedQueue;
-        }
-    }
-
     private void UpdateInputClient()
     {
         Vector2 inputDirection = Vector2.zero;
@@ -176,20 +127,62 @@ public class Player : NetworkBehaviour
         if (Input.GetKey(KeyCode.D)) inputDirection += Vector2.right;
         inputDirection = inputDirection.normalized;
 
+        bool stunPressed = m_StunBuffered;
+        m_StunBuffered = false;
+
+        int localTick = NetworkUtility.GetLocalTick();
+        int serverTick = NetworkManager.ServerTime.Tick;
+
         InputTick input = new InputTick
         {
             input = inputDirection,
-            tick = NetworkUtility.GetLocalTick()
+            stunPressed = stunPressed,
+            tick = localTick,
+            stunTick = serverTick,  // ← stocké pour PredictPosition
         };
 
         SendInputServerRpc(input);
+
+        if (stunPressed)
+            m_GameState.ApplyStun(localTick);
+
         PredictPosition(input);
-        m_StateTickQueue.Enqueue(m_PredictedPosition);
+    }
+
+    private void PredictPosition(InputTick input)
+    {
+        // ← utilise stunTick (server-space) au lieu de tick (local-space)
+        if (!m_GameState.IsStunnedAtTick(input.tick))
+        {
+            m_PredictedState.position += input.input * m_Velocity * TickDelta;
+        }
+
+        m_PredictedState.input = input;
+        m_PredictedState.position = ClampToGameArea(m_PredictedState.position);
+        m_StateHistory.Add(m_PredictedState);
+    }
+
+    private void Reconciliate()
+    {
+        // 1. Cull old predictions up to the tick the server just confirmed
+        m_StateHistory.RemoveAll(s => s.input.tick <= m_LatestServerState.input.tick);
+
+        // 2. Snap to the authoritative server state
+        m_PredictedState = m_LatestServerState;
+
+        // 3. Re-simulate the pending queue. Stun states will naturally evaluate correctly here.
+        List<StateTick> oldHistory = new List<StateTick>(m_StateHistory);
+        m_StateHistory.Clear();
+
+        foreach (var state in oldHistory)
+        {
+            PredictPosition(state.input);
+        }
     }
 
     private Vector2 ClampToGameArea(Vector2 pos)
     {
-        var size = GameState.GameSize;
+        var size = m_GameState.GameSize;
         pos.x = Mathf.Clamp(pos.x, -size.x + m_Size, size.x - m_Size);
         pos.y = Mathf.Clamp(pos.y, -size.y + m_Size, size.y - m_Size);
         return pos;
@@ -199,14 +192,5 @@ public class Player : NetworkBehaviour
     private void SendInputServerRpc(InputTick input)
     {
         m_InputQueue.Enqueue(input);
-    }
-
-    private void LogStateQueue(string label = "")
-    {
-        var sb = new System.Text.StringBuilder();
-        sb.Append($"[StateQueue {label}] Count={m_StateTickQueue.Count} | ");
-        foreach (var s in m_StateTickQueue)
-            sb.Append($"(Tick:{s.input.tick}, Pos:{s.position}) -> ");
-        Debug.Log(sb.ToString());
     }
 }
